@@ -5,10 +5,12 @@
  * SPDX-License-Identifier: MIT
  */
 
+import type { Server as HttpServer } from "node:http";
+import type { IncomingMessage } from "node:http";
 import { successTemplate, renderError } from "./templates";
 
 /**
- * Result object returned from OAuth callback containing authorization code or error details
+ * Result object returned from OAuth callback containing authorization code or error details.
  */
 export interface CallbackResult {
   /** Authorization code returned by OAuth provider */
@@ -26,7 +28,7 @@ export interface CallbackResult {
 }
 
 /**
- * Configuration options for the OAuth callback server
+ * Configuration options for the OAuth callback server.
  */
 export interface ServerOptions {
   /** Port number to bind the server to */
@@ -44,7 +46,7 @@ export interface ServerOptions {
 }
 
 /**
- * Interface for OAuth callback server implementations across different runtimes
+ * Interface for OAuth callback server implementations across different runtimes.
  */
 export interface CallbackServer {
   /** Start the HTTP server with the given options */
@@ -56,7 +58,7 @@ export interface CallbackServer {
 }
 
 /**
- * Generate HTML response for OAuth callback
+ * Generate HTML response for OAuth callback.
  * @param params - OAuth callback parameters (code, error, etc.)
  * @param successHtml - Custom success HTML template
  * @param errorHtml - Custom error HTML template with placeholder support
@@ -67,68 +69,153 @@ function generateCallbackHTML(
   successHtml?: string,
   errorHtml?: string,
 ): string {
-  if (params.error) {
-    // Use custom error HTML if provided
-    if (errorHtml) {
-      return errorHtml
-        .replace(/{{error}}/g, params.error || "")
-        .replace(/{{error_description}}/g, params.error_description || "")
-        .replace(/{{error_uri}}/g, params.error_uri || "");
-    }
-    return renderError({
-      error: params.error,
-      error_description: params.error_description,
-      error_uri: params.error_uri,
-    });
-  }
-  // Use custom success HTML if provided
-  return successHtml || successTemplate;
+  if (!params.error) return successHtml || successTemplate;
+
+  if (errorHtml)
+    return errorHtml
+      .replace(/{{error}}/g, params.error || "")
+      .replace(/{{error_description}}/g, params.error_description || "")
+      .replace(/{{error_uri}}/g, params.error_uri || "");
+
+  return renderError({
+    error: params.error,
+    error_description: params.error_description,
+    error_uri: params.error_uri,
+  });
 }
 
 /**
- * Bun runtime implementation using Bun.serve()
+ * Base class with shared logic for all runtime implementations.
  */
-class BunCallbackServer implements CallbackServer {
-  private server: any; // Runtime-specific server type (Bun.Server)
-  private callbackPromise?: {
-    resolve: (result: CallbackResult) => void;
-    reject: (error: Error) => void;
-  };
-  private callbackPath: string = "/callback";
-  private successHtml?: string;
-  private errorHtml?: string;
-  private onRequest?: (req: Request) => void;
+abstract class BaseCallbackServer implements CallbackServer {
+  // Use a Map to safely handle listeners for different paths.
+  // This is more robust than a single property, preventing potential race conditions.
+  protected callbackListeners = new Map<
+    string,
+    {
+      resolve: (result: CallbackResult) => void;
+      reject: (error: Error) => void;
+    }
+  >();
+  protected successHtml?: string;
+  protected errorHtml?: string;
+  protected onRequest?: (req: Request) => void;
   private abortHandler?: () => void;
+  private signal?: AbortSignal;
 
-  async start(options: ServerOptions): Promise<void> {
-    const {
-      port,
-      hostname = "localhost",
-      successHtml,
-      errorHtml,
-      signal,
-      onRequest,
-    } = options;
+  // Abstract methods to be implemented by subclasses for runtime-specific logic.
+  public abstract start(options: ServerOptions): Promise<void>;
+  protected abstract stopServer(): Promise<void>;
 
+  /**
+   * Sets up common properties and handles the abort signal.
+   */
+  protected setup(options: ServerOptions): void {
+    const { successHtml, errorHtml, signal, onRequest } = options;
     this.successHtml = successHtml;
     this.errorHtml = errorHtml;
     this.onRequest = onRequest;
+    this.signal = signal;
 
-    // Handle abort signal
-    if (signal) {
-      if (signal.aborted) {
-        throw new Error("Operation aborted");
-      }
-      this.abortHandler = () => {
-        this.stop();
-        if (this.callbackPromise) {
-          this.callbackPromise.reject(new Error("Operation aborted"));
-        }
-      };
-      signal.addEventListener("abort", this.abortHandler);
+    if (!signal) return;
+    if (signal.aborted) throw new Error("Operation aborted");
+
+    // The abort handler now just calls stop(), which handles cleanup.
+    this.abortHandler = () => this.stop();
+    signal.addEventListener("abort", this.abortHandler);
+  }
+
+  /**
+   * Handles incoming HTTP requests using Web Standards APIs.
+   * This logic is the same for all runtimes.
+   */
+  protected handleRequest(request: Request): Response {
+    this.onRequest?.(request);
+
+    const url = new URL(request.url);
+    const listener = this.callbackListeners.get(url.pathname);
+
+    if (!listener) return new Response("Not Found", { status: 404 });
+
+    const params: CallbackResult = {};
+    for (const [key, value] of url.searchParams) params[key] = value;
+
+    // Resolve the promise for the waiting listener.
+    listener.resolve(params);
+
+    return new Response(
+      generateCallbackHTML(params, this.successHtml, this.errorHtml),
+      {
+        status: 200,
+        headers: { "Content-Type": "text/html" },
+      },
+    );
+  }
+
+  /**
+   * Waits for the OAuth callback on a specific path.
+   */
+  public async waitForCallback(
+    path: string,
+    timeout: number,
+  ): Promise<CallbackResult> {
+    if (this.callbackListeners.has(path))
+      return Promise.reject(
+        new Error(`A listener for the path "${path}" is already active.`),
+      );
+
+    try {
+      // Race a promise that waits for the callback against a promise that rejects on timeout.
+      return await Promise.race([
+        // This promise is resolved or rejected by the handleRequest method.
+        new Promise<CallbackResult>((resolve, reject) => {
+          this.callbackListeners.set(path, { resolve, reject });
+        }),
+        // This promise rejects after the specified timeout.
+        new Promise<CallbackResult>((_, reject) => {
+          setTimeout(() => {
+            reject(
+              new Error(
+                `OAuth callback timeout after ${timeout}ms waiting for ${path}`,
+              ),
+            );
+          }, timeout);
+        }),
+      ]);
+    } finally {
+      // CRITICAL: Always clean up the listener to prevent memory leaks,
+      // regardless of whether the promise resolved or rejected.
+      this.callbackListeners.delete(path);
     }
+  }
 
-    // @ts-ignore - Bun global not available in TypeScript definitions
+  /**
+   * Stops the server and cleans up resources.
+   */
+  public async stop(): Promise<void> {
+    if (this.abortHandler && this.signal) {
+      this.signal.removeEventListener("abort", this.abortHandler);
+      this.abortHandler = undefined;
+    }
+    // Reject any pending promises before stopping the server.
+    for (const listener of this.callbackListeners.values())
+      listener.reject(new Error("Server stopped before callback received"));
+
+    this.callbackListeners.clear();
+    await this.stopServer();
+  }
+}
+
+/**
+ * Bun runtime implementation using Bun.serve().
+ */
+class BunCallbackServer extends BaseCallbackServer {
+  private server?: Bun.Server;
+
+  public async start(options: ServerOptions): Promise<void> {
+    this.setup(options);
+    const { port, hostname = "localhost" } = options;
+
     this.server = Bun.serve({
       port,
       hostname,
@@ -136,314 +223,59 @@ class BunCallbackServer implements CallbackServer {
     });
   }
 
-  private handleRequest(request: Request): Response {
-    // Call onRequest callback if provided
-    if (this.onRequest) {
-      this.onRequest(request);
-    }
-
-    const url = new URL(request.url);
-
-    if (url.pathname === this.callbackPath) {
-      const params: CallbackResult = {};
-
-      // Parse all query parameters
-      for (const [key, value] of url.searchParams) {
-        params[key] = value;
-      }
-
-      // Resolve the callback promise
-      if (this.callbackPromise) {
-        this.callbackPromise.resolve(params);
-      }
-
-      // Return success or error HTML page
-      return new Response(
-        generateCallbackHTML(params, this.successHtml, this.errorHtml),
-        {
-          status: 200,
-          headers: { "Content-Type": "text/html" },
-        },
-      );
-    }
-
-    return new Response("Not Found", { status: 404 });
-  }
-
-  async waitForCallback(
-    path: string,
-    timeout: number,
-  ): Promise<CallbackResult> {
-    this.callbackPath = path;
-
-    return new Promise((resolve, reject) => {
-      let isResolved = false;
-
-      const timer = setTimeout(() => {
-        if (!isResolved) {
-          isResolved = true;
-          this.callbackPromise = undefined;
-          reject(
-            new Error(
-              `OAuth callback timeout after ${timeout}ms waiting for ${path}`,
-            ),
-          );
-        }
-      }, timeout);
-
-      const wrappedResolve = (result: CallbackResult) => {
-        if (!isResolved) {
-          isResolved = true;
-          clearTimeout(timer);
-          this.callbackPromise = undefined;
-          resolve(result);
-        }
-      };
-
-      const wrappedReject = (error: Error) => {
-        if (!isResolved) {
-          isResolved = true;
-          clearTimeout(timer);
-          this.callbackPromise = undefined;
-          reject(error);
-        }
-      };
-
-      this.callbackPromise = { resolve: wrappedResolve, reject: wrappedReject };
-    });
-  }
-
-  async stop(): Promise<void> {
-    if (this.abortHandler) {
-      // Remove abort handler if it was set
-      const signal = this.server?.signal;
-      if (signal) {
-        signal.removeEventListener("abort", this.abortHandler);
-      }
-      this.abortHandler = undefined;
-    }
-    if (this.callbackPromise) {
-      this.callbackPromise.reject(
-        new Error("Server stopped before callback received"),
-      );
-      this.callbackPromise = undefined;
-    }
-    if (this.server) {
-      this.server.stop();
-      this.server = undefined;
-    }
-  }
-}
-
-/**
- * Deno runtime implementation using Deno.serve()
- */
-class DenoCallbackServer implements CallbackServer {
-  private server: any; // Runtime-specific server type (Deno.HttpServer)
-  private callbackPromise?: {
-    resolve: (result: CallbackResult) => void;
-    reject: (error: Error) => void;
-  };
-  private callbackPath: string = "/callback";
-  private abortController?: AbortController;
-  private successHtml?: string;
-  private errorHtml?: string;
-  private onRequest?: (req: Request) => void;
-  private abortHandler?: () => void;
-
-  async start(options: ServerOptions): Promise<void> {
-    const {
-      port,
-      hostname = "localhost",
-      successHtml,
-      errorHtml,
-      signal,
-      onRequest,
-    } = options;
-
-    this.successHtml = successHtml;
-    this.errorHtml = errorHtml;
-    this.onRequest = onRequest;
-
-    this.abortController = new AbortController();
-
-    // Handle user's abort signal
-    if (signal) {
-      if (signal.aborted) {
-        throw new Error("Operation aborted");
-      }
-      this.abortHandler = () => {
-        this.abortController?.abort();
-        if (this.callbackPromise) {
-          this.callbackPromise.reject(new Error("Operation aborted"));
-        }
-      };
-      signal.addEventListener("abort", this.abortHandler);
-    }
-
-    // @ts-ignore - Deno global not available in TypeScript definitions
-    this.server = Deno.serve(
-      { port, hostname, signal: this.abortController.signal },
-      (request: Request) => this.handleRequest(request),
-    );
-  }
-
-  private handleRequest(request: Request): Response {
-    // Call onRequest callback if provided
-    if (this.onRequest) {
-      this.onRequest(request);
-    }
-
-    const url = new URL(request.url);
-
-    if (url.pathname === this.callbackPath) {
-      const params: CallbackResult = {};
-
-      // Parse all query parameters
-      for (const [key, value] of url.searchParams) {
-        params[key] = value;
-      }
-
-      // Resolve the callback promise
-      if (this.callbackPromise) {
-        this.callbackPromise.resolve(params);
-      }
-
-      // Return success or error HTML page
-      return new Response(
-        generateCallbackHTML(params, this.successHtml, this.errorHtml),
-        {
-          status: 200,
-          headers: { "Content-Type": "text/html" },
-        },
-      );
-    }
-
-    return new Response("Not Found", { status: 404 });
-  }
-
-  async waitForCallback(
-    path: string,
-    timeout: number,
-  ): Promise<CallbackResult> {
-    this.callbackPath = path;
-
-    return new Promise((resolve, reject) => {
-      let isResolved = false;
-
-      const timer = setTimeout(() => {
-        if (!isResolved) {
-          isResolved = true;
-          this.callbackPromise = undefined;
-          reject(
-            new Error(
-              `OAuth callback timeout after ${timeout}ms waiting for ${path}`,
-            ),
-          );
-        }
-      }, timeout);
-
-      const wrappedResolve = (result: CallbackResult) => {
-        if (!isResolved) {
-          isResolved = true;
-          clearTimeout(timer);
-          this.callbackPromise = undefined;
-          resolve(result);
-        }
-      };
-
-      const wrappedReject = (error: Error) => {
-        if (!isResolved) {
-          isResolved = true;
-          clearTimeout(timer);
-          this.callbackPromise = undefined;
-          reject(error);
-        }
-      };
-
-      this.callbackPromise = { resolve: wrappedResolve, reject: wrappedReject };
-    });
-  }
-
-  async stop(): Promise<void> {
-    if (this.abortHandler) {
-      // Remove abort handler if it was set
-      const signal = this.server?.signal;
-      if (signal) {
-        signal.removeEventListener("abort", this.abortHandler);
-      }
-      this.abortHandler = undefined;
-    }
-    if (this.callbackPromise) {
-      this.callbackPromise.reject(
-        new Error("Server stopped before callback received"),
-      );
-      this.callbackPromise = undefined;
-    }
-    if (this.abortController) {
-      this.abortController.abort();
-      this.abortController = undefined;
-    }
+  protected async stopServer(): Promise<void> {
+    if (!this.server) return;
+    this.server.stop();
     this.server = undefined;
   }
 }
 
 /**
- * Node.js implementation using node:http with Web Standards APIs
- * Works with Node.js 18+ which has native Request/Response support
+ * Deno runtime implementation using Deno.serve().
  */
-class NodeCallbackServer implements CallbackServer {
-  private server?: any; // Runtime-specific server type (http.Server)
-  private callbackPromise?: {
-    resolve: (result: CallbackResult) => void;
-    reject: (error: Error) => void;
-  };
-  private callbackPath: string = "/callback";
-  private successHtml?: string;
-  private errorHtml?: string;
-  private onRequest?: (req: Request) => void;
-  private abortHandler?: () => void;
+class DenoCallbackServer extends BaseCallbackServer {
+  private abortController?: AbortController;
 
-  async start(options: ServerOptions): Promise<void> {
-    const {
-      port,
-      hostname = "localhost",
-      successHtml,
-      errorHtml,
-      signal,
-      onRequest,
-    } = options;
+  public async start(options: ServerOptions): Promise<void> {
+    this.setup(options);
+    const { port, hostname = "localhost" } = options;
+    this.abortController = new AbortController();
 
-    this.successHtml = successHtml;
-    this.errorHtml = errorHtml;
-    this.onRequest = onRequest;
+    // The user's signal will abort our internal controller.
+    options.signal?.addEventListener("abort", () =>
+      this.abortController?.abort(),
+    );
 
-    // Handle abort signal
-    if (signal) {
-      if (signal.aborted) {
-        throw new Error("Operation aborted");
-      }
-      this.abortHandler = () => {
-        this.stop();
-        if (this.callbackPromise) {
-          this.callbackPromise.reject(new Error("Operation aborted"));
-        }
-      };
-      signal.addEventListener("abort", this.abortHandler);
-    }
+    Deno.serve(
+      { port, hostname, signal: this.abortController.signal },
+      (request: Request) => this.handleRequest(request),
+    );
+  }
 
+  protected async stopServer(): Promise<void> {
+    if (!this.abortController) return;
+    this.abortController.abort();
+    this.abortController = undefined;
+  }
+}
+
+/**
+ * Node.js implementation using node:http with Web Standards APIs.
+ */
+class NodeCallbackServer extends BaseCallbackServer {
+  private server?: HttpServer;
+
+  public async start(options: ServerOptions): Promise<void> {
+    this.setup(options);
+    const { port, hostname = "localhost" } = options;
     const { createServer } = await import("node:http");
 
     return new Promise((resolve, reject) => {
       this.server = createServer(async (req, res) => {
         try {
-          // Convert Node.js IncomingMessage to Web Standards Request
-          const request = this.nodeToWebRequest(req, port);
+          const request = this.nodeToWebRequest(req, port, hostname);
+          const response = this.handleRequest(request);
 
-          // Handle request using Web Standards
-          const response = await this.handleRequest(request);
-
-          // Write Web Standards Response back to Node.js ServerResponse
           res.writeHead(
             response.status,
             Object.fromEntries(response.headers.entries()),
@@ -456,154 +288,57 @@ class NodeCallbackServer implements CallbackServer {
         }
       });
 
+      // Tie server closing to the abort signal if provided.
+      if (options.signal)
+        options.signal.addEventListener("abort", () => this.server?.close());
+
       this.server.listen(port, hostname, () => resolve());
       this.server.on("error", reject);
     });
   }
 
-  /**
-   * Convert Node.js IncomingMessage to Web Standards Request
-   */
-  private nodeToWebRequest(req: any, port: number): Request {
-    const url = new URL(req.url!, `http://localhost:${port}`);
+  protected async stopServer(): Promise<void> {
+    if (!this.server) return;
+    return new Promise((resolve) => {
+      this.server?.close(() => {
+        this.server = undefined;
+        resolve();
+      });
+    });
+  }
 
-    // Convert Node.js headers to Headers object
+  /**
+   * Converts a Node.js IncomingMessage to a Web Standards Request.
+   */
+  private nodeToWebRequest(
+    req: IncomingMessage,
+    port: number,
+    hostname?: string,
+  ): Request {
+    const host = req.headers.host || `${hostname}:${port}`;
+    const url = new URL(req.url!, `http://${host}`);
+
     const headers = new Headers();
     for (const [key, value] of Object.entries(req.headers)) {
-      if (typeof value === "string") {
-        headers.set(key, value);
-      } else if (Array.isArray(value)) {
-        headers.set(key, value.join(", "));
-      }
+      if (typeof value === "string") headers.set(key, value);
+      else if (Array.isArray(value)) headers.set(key, value.join(", "));
     }
 
-    // OAuth callbacks use GET requests without body
     return new Request(url.toString(), {
       method: req.method,
       headers,
     });
   }
-
-  /**
-   * Handle request using Web Standards APIs (same as Bun/Deno implementations)
-   */
-  private async handleRequest(request: Request): Promise<Response> {
-    // Call onRequest callback if provided
-    if (this.onRequest) {
-      this.onRequest(request);
-    }
-
-    const url = new URL(request.url);
-
-    if (url.pathname === this.callbackPath) {
-      const params: CallbackResult = {};
-
-      // Parse all query parameters
-      for (const [key, value] of url.searchParams) {
-        params[key] = value;
-      }
-
-      // Resolve the callback promise
-      if (this.callbackPromise) {
-        this.callbackPromise.resolve(params);
-      }
-
-      // Return success or error HTML page
-      return new Response(
-        generateCallbackHTML(params, this.successHtml, this.errorHtml),
-        {
-          status: 200,
-          headers: { "Content-Type": "text/html" },
-        },
-      );
-    }
-
-    return new Response("Not Found", { status: 404 });
-  }
-
-  async waitForCallback(
-    path: string,
-    timeout: number,
-  ): Promise<CallbackResult> {
-    this.callbackPath = path;
-
-    return new Promise((resolve, reject) => {
-      let isResolved = false;
-
-      const timer = setTimeout(() => {
-        if (!isResolved) {
-          isResolved = true;
-          this.callbackPromise = undefined;
-          reject(
-            new Error(
-              `OAuth callback timeout after ${timeout}ms waiting for ${path}`,
-            ),
-          );
-        }
-      }, timeout);
-
-      const wrappedResolve = (result: CallbackResult) => {
-        if (!isResolved) {
-          isResolved = true;
-          clearTimeout(timer);
-          this.callbackPromise = undefined;
-          resolve(result);
-        }
-      };
-
-      const wrappedReject = (error: Error) => {
-        if (!isResolved) {
-          isResolved = true;
-          clearTimeout(timer);
-          this.callbackPromise = undefined;
-          reject(error);
-        }
-      };
-
-      this.callbackPromise = { resolve: wrappedResolve, reject: wrappedReject };
-    });
-  }
-
-  async stop(): Promise<void> {
-    if (this.abortHandler) {
-      // Remove abort handler if it was set
-      const signal = this.server?.signal;
-      if (signal) {
-        signal.removeEventListener("abort", this.abortHandler);
-      }
-      this.abortHandler = undefined;
-    }
-    if (this.callbackPromise) {
-      this.callbackPromise.reject(
-        new Error("Server stopped before callback received"),
-      );
-      this.callbackPromise = undefined;
-    }
-    if (this.server) {
-      return new Promise((resolve) => {
-        this.server.close(() => resolve());
-        this.server = undefined;
-      });
-    }
-  }
 }
 
 /**
- * Create a callback server for the current runtime (Bun, Deno, or Node.js)
- * Automatically detects the runtime and returns appropriate server implementation
- * @returns CallbackServer instance optimized for the current runtime
+ * Create a callback server for the current runtime (Bun, Deno, or Node.js).
+ * Automatically detects the runtime and returns the appropriate server implementation.
+ * @returns CallbackServer instance optimized for the current runtime.
  */
 export function createCallbackServer(): CallbackServer {
-  // @ts-ignore - Bun global not available in TypeScript definitions
-  if (typeof Bun !== "undefined") {
-    return new BunCallbackServer();
-  }
+  if (typeof Bun !== "undefined") return new BunCallbackServer();
+  if (typeof Deno !== "undefined") return new DenoCallbackServer();
 
-  // @ts-ignore - Deno global not available in TypeScript definitions
-  if (typeof Deno !== "undefined") {
-    return new DenoCallbackServer();
-  }
-
-  // Default to Node.js
   return new NodeCallbackServer();
 }
